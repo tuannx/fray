@@ -1,12 +1,23 @@
 import org.gradle.nativeplatform.platform.internal.DefaultNativePlatform.getCurrentOperatingSystem
 
-plugins { id("java") }
+plugins {
+  id("java")
+  alias(libs.plugins.kotlin.jvm)
+}
 
 group = "org.pastalab.fray.test"
 
 java { toolchain { languageVersion.set(JavaLanguageVersion.of(25)) } }
 
+kotlin {
+  jvmToolchain(25)
+  compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_24) }
+}
+
+tasks.withType<JavaCompile>().configureEach { options.release.set(24) }
+
 dependencies {
+  implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
   testImplementation(project(":core"))
   testImplementation(libs.classgraph)
   testRuntimeOnly(libs.junit.platform.launcher)
@@ -17,6 +28,8 @@ dependencies {
 }
 
 tasks.test {
+  systemProperty("fray.coroutine.poc", System.getProperty("fray.coroutine.poc", "false"))
+  systemProperty("fray.coroutine.memory", System.getProperty("fray.coroutine.memory", "false"))
   useJUnitPlatform()
   maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
   val jvmti = project(":jvmti")
