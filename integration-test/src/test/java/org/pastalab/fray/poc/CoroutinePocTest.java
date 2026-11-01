@@ -1,5 +1,6 @@
 package org.pastalab.fray.poc;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -28,6 +29,7 @@ import org.pastalab.fray.core.scheduler.RandomScheduler;
 public class CoroutinePocTest {
 
   private Throwable run(String method, int iterations, boolean interleaveMemoryOps) {
+    System.clearProperty("fray.coroutine.completed." + method);
     System.setProperty("fray.recordSchedule", "true");
     List<String> classpaths =
         Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator)).toList();
@@ -35,7 +37,7 @@ public class CoroutinePocTest {
         new Configuration(
             new ExecutionInfo(
                 new MethodExecutor(
-                    "org.pastalab.fray.poc.CoroutineCases",
+                    "org.pastalab.fray.test.poc.CoroutineCases",
                     method,
                     List.of(),
                     classpaths,
@@ -74,11 +76,13 @@ public class CoroutinePocTest {
   @Test
   public void baseline() {
     assertNull(run("baseline", 10, interleaveMemoryOps()));
+    assertEquals("10", System.getProperty("fray.coroutine.completed.baseline"));
   }
 
   @Test
   public void mutex() {
     assertNull(run("mutex", 10, interleaveMemoryOps()));
+    assertEquals("10", System.getProperty("fray.coroutine.completed.mutex"));
   }
 
   @Test

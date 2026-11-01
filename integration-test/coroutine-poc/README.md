@@ -1,18 +1,26 @@
-# Experimental Kotlin/JVM coroutine probes
+# Kotlin/JVM coroutine investigation
 
-These opt-in probes exercise `runBlocking`, real `Dispatchers.Default`, `async`/`launch`,
-an intentionally racy counter, and a `Mutex` counterpart. They are not a claim of Kotlin
-coroutine or Android support. They use Fray's `TestRunner` directly; by default memory-operation
-interleaving is off, matching the current JUnit extension setting. `--memory` enables it explicitly.
-The race probe expects an application `lost update` failure, and rejects Fray internal errors;
-no observed race in a bounded search is not evidence of correctness. Reports are written to
-`integration-test/build/coroutine-poc/<case>/` and schedule recording is enabled.
+This is an opt-in investigation, not a claim that Fray supports Kotlin coroutines. The probes use
+`runBlocking` and the real `Dispatchers.Default` with `async` or `launch`, plus an intentional
+shared counter race and a `Mutex`-protected counterpart. Android ART, Kotlin/Native, JS and Wasm
+are outside its scope. Race detection and coroutine replay have **not** been demonstrated.
 
-The probes are opt-in because the baseline has been observed to hang in Fray. On POSIX, run one
-at a time with the external timeout below. The timeout includes Gradle build time; check the log
-for `:integration-test:test` before interpreting a timeout as a test hang. Dependencies must first
-be available in the Gradle cache (`--offline` is used by the script). Set `JAVA_HOME` to JDK 25
-and `JDK11` to a JDK 11 installation if Gradle cannot discover one.
+Kotlin is a language; Kotlin/JVM produces JVM code. A suspending function is compiled using
+continuations and a state machine, and can resume on a different thread. `Dispatchers.Default` uses
+a shared JVM worker pool; `Mutex` suspends a coroutine rather than simply blocking a thread. Fray
+currently schedules JVM threads and intercepts selected JVM operations, so the interaction with
+that pool and suspension machinery needs separate testing. See the official
+[Kotlin coroutine specification](https://kotlinlang.org/spec/asynchronous-programming-with-coroutines.html),
+[dispatcher documentation](https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html),
+and [shared-state guide](https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html).
+
+## Run the probes
+
+The probes can hang. On POSIX, run one at a time with the external process timeout below. The
+limit includes Gradle startup and build time; verify the log reached `:integration-test:test`
+before treating a timeout as a test hang. The script exits 124 on timeout. Set `JAVA_HOME` and
+`JDK25` to a JDK 25, and `JDK11` to a JDK 11. The script uses `--offline`, so dependencies must
+already be in the Gradle cache.
 
 ```sh
 python3 integration-test/coroutine-poc/run.py baseline --timeout 90
@@ -21,33 +29,105 @@ python3 integration-test/coroutine-poc/run.py race --timeout 75
 python3 integration-test/coroutine-poc/run.py baseline --memory --timeout 90
 ```
 
-Tested locally at Fray `e39d21675293164602756bb8210c7f4e6584b879` with Corretto 25.0.1,
-Kotlin 2.2.21, kotlinx-coroutines 1.10.1 and Gradle 9.0.0. The same baseline and mutex code
-completed on a normal JVM without the Fray agent. The Fray baseline did not complete within a
-90-second bounded command with default memory interleaving; a thread dump showed threads parked
-in Fray while executing coroutine scheduler and continuation code. The mutex and race probes each timed
-out after a 75-second bounded command. A separate run with memory interleaving enabled hung and
-a thread dump showed Fray parking during coroutine scheduler worker creation.
-This is an observation of this configuration, not a diagnosis of all coroutine behavior. No
-application race or replay was demonstrated by these observations.
+The workload now lives in `org.pastalab.fray.test.poc`, a namespace Fray instruments. The race
+uses separate `AtomicInteger.get` and `set` operations, with the same operations inside `Mutex` for
+the protected case. The runner uses `interleaveMemoryOps=false` by default, matching the JUnit
+extension; `--memory` enables it. The baseline and mutex probes also require a completion counter:
+`TestRunner.run() == null` alone does not prove completion, because a scheduling step limit can
+stop exploration without recording an application bug. A bounded failure to find a race likewise
+does not prove correctness. Reports are written to `integration-test/build/coroutine-poc/<case>/`.
 
-For a control outside Fray, first compile the fixtures (`./gradlew :integration-test:classes`),
-then run them with the same JDK and dependencies. The cache paths vary by Gradle user home:
+For a normal JVM control without the Fray agent, first compile the fixtures and use the same JDK
+and cached dependencies:
 
 ```sh
+./gradlew :integration-test:classes
 CACHE="${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2/files-2.1"
 COROUTINES_JAR=$(find "$CACHE/org.jetbrains.kotlinx/kotlinx-coroutines-core-jvm/1.10.1" -name '*.jar' | head -1)
 STDLIB_JAR=$(find "$CACHE/org.jetbrains.kotlin/kotlin-stdlib/2.2.21" -name '*.jar' | head -1)
-"$JAVA_HOME/bin/java" -cp "integration-test/build/classes/kotlin/main:$COROUTINES_JAR:$STDLIB_JAR" org.pastalab.fray.poc.CoroutineControl
+"$JAVA_HOME/bin/java" -cp "integration-test/build/classes/kotlin/main:$COROUTINES_JAR:$STDLIB_JAR" org.pastalab.fray.test.poc.CoroutineControl
 ```
 
-The control runs only the baseline and mutex workloads; it does not test Fray or the race probe.
+This control runs only baseline and mutex; it does not test Fray or the race probe.
 
-## Validation results
+## What the investigation found
 
-The following commands ran from the repository root with JDK 25 as `JAVA_HOME` and `JDK25`,
-JDK 11 as `JDK11`, and a populated, isolated `GRADLE_USER_HOME`. They used the versions listed
-above; `--offline` requires the dependencies to be cached.
+The environment was macOS arm64, Corretto 25.0.1, Gradle 9.0.0, Kotlin 2.2.21 and
+`kotlinx-coroutines-core` 1.10.1, based on Fray `e39d21675293164602756bb8210c7f4e6584b879`.
+
+- The **original** POC placed its workload in `org.pastalab.fray.poc`, a namespace Fray excluded
+  from application instrumentation. Its normal-JVM baseline and mutex completed; under Fray,
+  baseline, mutex and race reached the test task but exceeded 90, 75 and 75 second external
+  deadlines respectively. These are historical observations of the excluded fixture, not race
+  coverage for the corrected fixture.
+- A corrected, instrumentable fixture still reached the test task and exceeded a 120-second
+  deadline when only the thread-bookkeeping guard had been changed. There was no completed
+  coroutine test or demonstrated replay in that run.
+- A controlled class-initialization reproducer showed a JVM initialization-lock deadlock: a Fray
+  scheduling point inside an excluded initializer let a second thread wait on the same class.
+  An isolated experiment applying Fray's existing class-initialization scheduling guard to the
+  reproducer completed. This proves that interaction in the reproducer, not that every coroutine
+  timeout has the same cause.
+- An excluded Java helper calling `LockSupport.parkNanos` on a managed worker exceeded a 60-second
+  deadline; selectively applying Fray's existing timed-wait call-site transform to that helper
+  completed the same sentinel-checked test. The coroutine scheduler has an analogous timed park,
+  but a timed-park-only coroutine experiment did not complete and hit a liveness cutoff or an
+  out-of-memory error. It is not a sufficient fix.
+- In a separate combined instrumentation experiment the `runBlocking` workload reached its
+  completion marker, but teardown remained blocked on the shared `Dispatchers.Default` workers
+  and the run eventually exhausted memory. Fray's existing pool teardown recognizes its own
+  replacement `ForkJoinPool`, not this long-lived shared pool. Ignoring every daemon or shutting
+  down the global dispatcher would risk missing live work or contaminating later iterations. A
+  safe worker ownership, quiescence and iteration-isolation design is still needed before claiming
+  support. The experiment was not a complete successful Fray test.
+
+The diagnostic observations identify several distinct interactions; they do not establish the
+root cause of every timeout. The next design decision is how Fray should model and safely retire
+or isolate shared dispatcher workers across iterations while preserving scheduling and replay.
+
+## Focused fixes and checks
+
+The current change guards Fray's thread-bookkeeping lookup against reentrant scheduling. Its
+focused unit regression passed 1/1; the same test failed on the pre-fix runtime. It also applies
+the existing class-initialization scheduling guard to `kotlinx.coroutines` initializers without
+enabling general coroutine-library instrumentation. Its bounded, deterministic regression passed
+1/1; the pre-fix reproduction timed out. These fixes address the measured mechanisms; they do not
+resolve the shared dispatcher lifecycle or establish coroutine support. After both fixes, the
+corrected baseline command `python3 integration-test/coroutine-poc/run.py baseline --timeout 90`
+reached the test task and exited 124 at its external deadline, which included build time; it did
+not produce a completed test result.
+
+```sh
+./gradlew --offline --no-daemon :core:test \
+  --tests org.pastalab.fray.core.delegates.RuntimeDelegateThreadGuardTest
+./gradlew --offline --no-daemon :instrumentation:base:spotlessApply \
+  :integration-test:spotlessApply :integration-test:test \
+  --tests org.pastalab.fray.poc.CoroutineClinitTest
+./gradlew --offline --no-daemon :core:test \
+  :instrumentation:base:spotlessCheck :integration-test:spotlessCheck
+./gradlew --offline --no-daemon :instrumentation:base:spotlessCheck \
+  :instrumentation:base:test --tests trycatch.CoroutineInitializerTransformTest
+./gradlew --offline --no-daemon :instrumentation:base:test
+./gradlew --offline --no-daemon :integration-test:test \
+  --tests org.pastalab.fray.test.FrayTestCase.testOne \
+  --tests org.pastalab.fray.poc.CoroutineClinitTest
+```
+
+The core and formatting command passed all 15 core tests without skips and both formatting
+checks. The focused instrumentation command passed 2/2, covering explicit prefix exclusions and
+normal and exceptional initializer exits; the full instrumentation base suite passed 5/5 without
+skips. The selected integration command passed 2/2 with no
+skips; `FrayTestCase.testOne` does
+not assert the runner's result. A current run of the aggregate integration command below reached
+the tests but exited 124 at an external 120-second deadline, including startup. Partial output
+showed `AsyncClientConnectNoServerException` failing at `FrayTestCase.java:47`; there was no final
+count or fresh XML. Its cause is unknown.
+
+## Earlier regression checks
+
+The following commands ran with JDK 25 as `JAVA_HOME` and `JDK25`, JDK 11 as `JDK11`, and a
+populated isolated Gradle cache. These checks predate the subsequent guard and initializer edits;
+they are not a substitute for validation of the current tree.
 
 ```sh
 ./gradlew --offline --no-daemon :integration-test:test \
@@ -56,20 +136,15 @@ above; `--offline` requires the dependencies to be cached.
 ./gradlew --offline --no-daemon :integration-test:spotlessCheck :core:test
 ```
 
-The selected integration regression completed 1/1 and the selected replay scheduler tests
-completed 2/2; the integration test does not assert the runner's result, and the scheduler tests
-do not demonstrate coroutine replay. The second command passed formatting and all 14 core tests.
+The selected integration regression completed 1/1 and the selected replay scheduler tests 2/2;
+that integration test does not assert the runner result, and the scheduler tests do not demonstrate
+coroutine replay. Formatting and all 14 core tests passed.
 
-The broader integration command below was stopped by an external 120-second deadline, including
-Gradle startup (exit 124). Before interruption, two network fixtures,
-`AsyncClientConnectNoServerException` and `SyncClientExceptionWithoutServer`, failed because the
-runner returned null where an exception was expected. No final test count or fresh XML was
-available. The causes of these failures and of the coroutine timeouts are unknown; their relationship
-to this POC has not been established. The full repository build/check was not run.
-
-```sh
-./gradlew --offline --no-daemon :integration-test:test
-```
-
-These results do not establish race detection or replay for coroutines, or support for Android
-or Kotlin/Native.
+The aggregate integration command is `./gradlew --offline --no-daemon :integration-test:test`.
+The earlier run was stopped at an external
+120-second deadline (exit 124, including startup). Two network fixtures,
+`AsyncClientConnectNoServerException` and `SyncClientExceptionWithoutServer`, failed before the
+interruption; there was no final count or fresh XML. Both failures also reproduced on unchanged
+upstream `e39d216` when `FrayTestCase.testCases` was stopped after a 240-second external deadline.
+Those fixtures expect no server at `localhost:12345`; a listener was observed during the test, but
+the root cause of the failures has not been proven. A full repository build/check was not run.

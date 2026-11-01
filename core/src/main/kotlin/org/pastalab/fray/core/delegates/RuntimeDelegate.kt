@@ -13,6 +13,7 @@ import java.util.concurrent.locks.LockSupport
 import java.util.concurrent.locks.StampedLock
 import org.pastalab.fray.core.RunContext
 import org.pastalab.fray.core.concurrency.operations.BLOCKED_OPERATION_NOT_TIMED
+import org.pastalab.fray.core.observers.ExperimentalParkTrace
 import org.pastalab.fray.runtime.Delegate
 import org.pastalab.fray.runtime.MemoryOpType
 
@@ -39,19 +40,20 @@ class RuntimeDelegate(val context: RunContext, val synchronizer: DelegateSynchro
     return "InnocuousThreadGroup" == systemGroup?.name || thread.name == "JNA Cleaner"
   }
 
-  private fun onThreadSkip(t: Thread, runnable: () -> Unit) {
+  private inline fun onThreadSkip(t: Thread, runnable: () -> Unit) {
     if (synchronizer.entered.get()) {
       return
     }
-    if (!context.registeredThreads.containsKey(Thread.currentThread().id)) {
-      return
-    }
-    if (isSystemThread(t)) {
-      return
-    }
-
     try {
+      // The lookup itself reads instrumented JDK state; suppress reentrant scheduling while
+      // inspecting Fray's bookkeeping, before consulting the registered thread map.
       synchronizer.entered.set(true)
+      if (!context.registeredThreads.containsKey(Thread.currentThread().id)) {
+        return
+      }
+      if (isSystemThread(t)) {
+        return
+      }
       runnable()
     } finally {
       synchronizer.entered.set(false)
@@ -469,8 +471,22 @@ class RuntimeDelegate(val context: RunContext, val synchronizer: DelegateSynchro
     }
   }
 
-  private fun onThreadParkTimed(blockedUntil: Long, originBlock: () -> Unit) {
-    synchronizer.runInFrayStart("Thread.park") { context.threadPark() }
+  private fun onThreadParkTimed(
+      blockedUntil: Long,
+      traceNanos: Long? = null,
+      originBlock: () -> Unit,
+  ) {
+    synchronizer.runInFrayStart("Thread.park") {
+      if (ExperimentalParkTrace.enabled) {
+        ExperimentalParkTrace.event(
+            context,
+            "PARK_START",
+            "nanos=$traceNanos blockedUntil=$blockedUntil",
+            true,
+        )
+      }
+      context.threadPark()
+    }
     synchronizer.runInFrayDoneWithOriginBlock(
         "Thread.park",
         {
@@ -490,7 +506,7 @@ class RuntimeDelegate(val context: RunContext, val synchronizer: DelegateSynchro
         } else {
           BLOCKED_OPERATION_NOT_TIMED
         }
-    onThreadParkTimed(blockedUntil) { LockSupport.parkNanos(nanos) }
+    onThreadParkTimed(blockedUntil, nanos) { LockSupport.parkNanos(nanos) }
   }
 
   override fun onThreadParkUntil(deadline: Long) =
@@ -498,7 +514,8 @@ class RuntimeDelegate(val context: RunContext, val synchronizer: DelegateSynchro
 
   override fun onThreadParkNanosWithBlocker(blocker: Any?, nanos: Long) =
       onThreadParkTimed(
-          context.timeController.currentTimeMillisRawNoIncrement() + nanos / 1_000_000
+          context.timeController.currentTimeMillisRawNoIncrement() + nanos / 1_000_000,
+          nanos,
       ) {
         LockSupport.parkNanos(blocker, nanos)
       }

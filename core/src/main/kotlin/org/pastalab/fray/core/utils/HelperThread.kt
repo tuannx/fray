@@ -3,6 +3,10 @@ package org.pastalab.fray.core.utils
 class HelperThread : Thread("fray-helper-thread") {
   var shouldStop = false
   var currentRunnable: Runnable? = null
+  @Volatile private var retainFailures = false
+  @Volatile
+  var firstFailure: Throwable? = null
+    private set
 
   init {
     isDaemon = true
@@ -21,6 +25,7 @@ class HelperThread : Thread("fray-helper-thread") {
       try {
         job?.run()
       } catch (e: Throwable) {
+        if (retainFailures && firstFailure == null) firstFailure = e
         e.printStackTrace()
       }
     }
@@ -39,5 +44,17 @@ class HelperThread : Thread("fray-helper-thread") {
       shouldStop = true
       (this as Object).notify()
     }
+  }
+
+  /** Enable before submitting any jobs; retaining a Throwable is opt-in. */
+  fun enableFailureRetention() {
+    retainFailures = true
+  }
+
+  /** Wait outside Fray's managed execution; zero would mean an unbounded Thread.join. */
+  fun awaitTermination(timeoutMillis: Long): Boolean {
+    require(timeoutMillis > 0) { "helper join timeout must be positive" }
+    join(timeoutMillis)
+    return !isAlive
   }
 }

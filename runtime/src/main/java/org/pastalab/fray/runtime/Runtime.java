@@ -24,6 +24,14 @@ public class Runtime {
   public static Delegate LOCK_DELEGATE = new Delegate();
   public static NetworkDelegate NETWORK_DELEGATE = new NetworkDelegate();
 
+  // Fast negative hint only. Registry ownership and graph checks remain authoritative under lock.
+  // The package-private writer is used only by CoroutineInstrumentationOwners.
+  static volatile boolean coroutineOwnerPublished;
+
+  public static boolean hasCoroutineInstrumentationOwner() {
+    return coroutineOwnerPublished;
+  }
+
   private static boolean DEBUG_MODE_INITIALIZED = false;
   private static boolean DEBUG_MODE = false;
 

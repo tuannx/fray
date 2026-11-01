@@ -119,6 +119,12 @@ class MethodExitVisitor(
     methodExitInsnCount = 0
   }
 
+  /** Call immediately after a begin hook succeeds; a failed begin has no matching end. */
+  fun excludeEntryFromFinalBlock() {
+    methodEnterLabel = mark()
+    methodExitInsnCount = 0
+  }
+
   override fun visitInsn(opcode: Int) {
     when (opcode) {
       IRETURN,

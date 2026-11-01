@@ -19,6 +19,7 @@ tasks.withType<JavaCompile>().configureEach { options.release.set(24) }
 dependencies {
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
   testImplementation(project(":core"))
+  testImplementation(project(":instrumentation:base"))
   testImplementation(libs.classgraph)
   testRuntimeOnly(libs.junit.platform.launcher)
   testCompileOnly(project(":runtime"))
@@ -30,8 +31,12 @@ dependencies {
 tasks.test {
   systemProperty("fray.coroutine.poc", System.getProperty("fray.coroutine.poc", "false"))
   systemProperty("fray.coroutine.memory", System.getProperty("fray.coroutine.memory", "false"))
+  systemProperty(
+      "fray.coroutine.experiment",
+      System.getProperty("fray.coroutine.experiment", "false"),
+  )
   useJUnitPlatform()
-  maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceAtLeast(1)
+  maxParallelForks = 1
   val jvmti = project(":jvmti")
   val jdk = project(":instrumentation:jdk")
   val agent = project(":instrumentation:agent")
@@ -53,7 +58,7 @@ tasks.test {
         "-javaagent:${agent.layout.buildDirectory.get().asFile}${File.separator}libs${File.separator}" +
             "${agent.base.archivesName.get()}-${agent.version}.jar"
     )
-    jvmArgs("-Dfray.debug=true")
+    jvmArgs("-Dfray.debug=false")
   }
 }
 

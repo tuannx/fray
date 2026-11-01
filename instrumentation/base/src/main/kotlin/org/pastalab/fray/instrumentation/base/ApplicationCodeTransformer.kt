@@ -13,6 +13,8 @@ import org.pastalab.fray.instrumentation.base.visitors.ArrayOperationInstrumente
 import org.pastalab.fray.instrumentation.base.visitors.ClassConstructorInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.ClassVersionInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.ConditionInstrumenter
+import org.pastalab.fray.instrumentation.base.visitors.CoroutineJobInstrumenter
+import org.pastalab.fray.instrumentation.base.visitors.CoroutineSchedulerInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.LoadClassInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.MonitorInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.ObjectNotifyInstrumenter
@@ -24,6 +26,7 @@ import org.pastalab.fray.instrumentation.base.visitors.TargetExitInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.TimeInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.TimedWaitInstrumenter
 import org.pastalab.fray.instrumentation.base.visitors.VolatileFieldsInstrumenter
+import org.pastalab.fray.runtime.CoroutineInstrumentationOwners
 import org.pastalab.fray.runtime.Runtime
 
 class ApplicationCodeTransformer(
@@ -53,15 +56,122 @@ class ApplicationCodeTransformer(
       protectionDomain: ProtectionDomain?,
       classfileBuffer: ByteArray,
   ): ByteArray {
-    // Skip Fray runtime classes and explicitly excluded classes.
     if (
-        isFrayRuntimeClass(className) ||
-            excludedClassPrefixes.any(className.replace('/', '.')::startsWith)
+        className.startsWith("kotlinx/coroutines/") &&
+            Runtime.hasCoroutineInstrumentationOwner() &&
+            CoroutineInstrumentationOwners.owns(loader)
     ) {
+      if (classBeingRedefined != null) {
+        CoroutineInstrumentationOwners.markFailure(
+            loader,
+            "owned coroutine redefinition: $className",
+        )
+        return classfileBuffer
+      }
+      // Partial exclusions would silently leave scheduler primitives uncontrolled. Reject the
+      // entire opt-in epoch instead of falling back to the host or uninstrumented coroutine code.
+      val coroutinePrefix = "kotlinx.coroutines"
+      if (
+          excludedClassPrefixes.any {
+            coroutinePrefix.startsWith(it) || it.startsWith("$coroutinePrefix.")
+          }
+      ) {
+        CoroutineInstrumentationOwners.markFailure(loader, "coroutine classes are excluded")
+        return classfileBuffer
+      }
+      try {
+        Runtime.onSkipPrimitive("instrumentation")
+        if (CoroutineInstrumentationOwners.hasAppGraph(loader)) {
+          CoroutineInstrumentationOwners.verifyCoroutineInput(loader, className, classfileBuffer)
+        }
+        val reader = ClassReader(classfileBuffer)
+        val node = ClassNode()
+        var visitor: ClassVisitor = CoroutineJobInstrumenter(node)
+        visitor = CoroutineSchedulerInstrumenter(visitor)
+        visitor = ClassConstructorInstrumenter(visitor, false, experimentalSkipPrimitive = true)
+        visitor = TimedWaitInstrumenter(visitor)
+        // Experimental only: route the owned worker RNG's nanoTime seed through Fray's clock.
+        visitor = TimeInstrumenter(visitor)
+        visitor = SynchronizedMethodInstrumenter(visitor, false)
+        visitor = MonitorInstrumenter(visitor)
+        val versionVisitor = ClassVersionInstrumenter(visitor)
+        reader.accept(versionVisitor, ClassReader.EXPAND_FRAMES)
+        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+        if (versionVisitor.classVersion >= Opcodes.V1_5) {
+          node.accept(CheckClassAdapter(writer))
+        } else {
+          node.accept(writer)
+        }
+        val output = writer.toByteArray()
+        require(ClassReader(output).className == className) {
+          "owned coroutine output name mismatch"
+        }
+        CoroutineInstrumentationOwners.markTransformed(loader, className)
+        return output
+      } catch (e: Throwable) {
+        // The JVM may suppress transformer exceptions. The owning loader checks this poison state
+        // after defineClass and must not fall back to the parent or treat the epoch as successful.
+        CoroutineInstrumentationOwners.markFailure(loader, "$className: ${e.javaClass.name}")
+        return classfileBuffer
+      } finally {
+        Runtime.onSkipPrimitiveDone("instrumentation")
+      }
+    }
+    // Lab-only verified app graph. The normal transformer below remains unchanged for every
+    // loader without a registered graph. A fixed, trusted agent chain is a required process
+    // precondition: this handshake cannot detect a transformer running after Fray.
+    val strictApp =
+        Runtime.hasCoroutineInstrumentationOwner() &&
+            CoroutineInstrumentationOwners.hasAppGraph(loader)
+    if (strictApp) {
+      val excluded = excludedClassPrefixes.any(className.replace('/', '.')::startsWith)
+      if (
+          !CoroutineInstrumentationOwners.expectsApp(loader, className) ||
+              classBeingRedefined != null ||
+              excluded ||
+              isFrayRuntimeClass(className) ||
+              className.startsWith("org/mockito") ||
+              className.startsWith("net/bytebuddy")
+      ) {
+        CoroutineInstrumentationOwners.markFailure(
+            loader,
+            "unsupported owned app transform: $className",
+        )
+        return classfileBuffer
+      }
+      try {
+        CoroutineInstrumentationOwners.verifyAppInput(loader, className, classfileBuffer)
+      } catch (failure: Throwable) {
+        CoroutineInstrumentationOwners.markFailure(loader, "invalid owned app input: $className")
+        return classfileBuffer
+      }
+    }
+    // Explicit user exclusions also apply to the narrowly instrumented coroutine classes.
+    if (excludedClassPrefixes.any(className.replace('/', '.')::startsWith)) {
       return classfileBuffer
     }
+    if (className.startsWith("kotlinx/coroutines/")) {
+      // Coroutine internals are otherwise excluded. A JVM atomic call from their <clinit>
+      // can still enter Fray via JDK instrumentation while holding the JVM initialization
+      // lock. Keep the existing class-initialization scheduling guard without enabling
+      // application instrumentation throughout the coroutine library.
+      try {
+        Runtime.onSkipPrimitive("instrumentation")
+        val reader = ClassReader(classfileBuffer)
+        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+        reader.accept(ClassConstructorInstrumenter(writer, false), ClassReader.EXPAND_FRAMES)
+        return writer.toByteArray()
+      } catch (e: Throwable) {
+        println("Failed to instrument coroutine initializer: $className")
+        e.printStackTrace()
+        return classfileBuffer
+      } finally {
+        Runtime.onSkipPrimitiveDone("instrumentation")
+      }
+    }
+    if (isFrayRuntimeClass(className)) return classfileBuffer
     val classIdentifier = (protectionDomain?.codeSource?.location?.path ?: "null:") + className
-    if (instrumentedClassCache.containsKey(classIdentifier)) {
+    if (!strictApp && instrumentedClassCache.containsKey(classIdentifier)) {
       return instrumentedClassCache[classIdentifier]!!
     }
     try {
@@ -74,7 +184,10 @@ class ApplicationCodeTransformer(
       var cv: ClassVisitor = ObjectNotifyInstrumenter(cn)
       cv = TargetExitInstrumenter(cv)
       cv = TimedWaitInstrumenter(cv)
-      cv = VolatileFieldsInstrumenter(cv, false, interleaveAllMemoryOps)
+      // Scope the all-memory mode to frozen app classes even when the normal agent defaults to
+      // volatile-only. The visitor still excludes constructors and class initializers, so this
+      // handshake does not establish complete plain-field coverage.
+      cv = VolatileFieldsInstrumenter(cv, false, interleaveAllMemoryOps || strictApp)
       cv = ObjectNotifyInstrumenter(cv)
 
       cv =
@@ -108,9 +221,20 @@ class ApplicationCodeTransformer(
       if (Runtime.getDebugMode()) {
         Utils.writeClassFile(className, out, true)
       }
-      instrumentedClassCache[classIdentifier] = out
+      if (strictApp) {
+        require(ClassReader(out).className == className) { "owned app output name mismatch" }
+        CoroutineInstrumentationOwners.markAppTransformed(loader, className, out)
+      } else {
+        instrumentedClassCache[classIdentifier] = out
+      }
       return out
     } catch (e: Throwable) {
+      if (strictApp) {
+        CoroutineInstrumentationOwners.markFailure(
+            loader,
+            "owned app transformation failed: $className",
+        )
+      }
       println("Failed to instrument: $className")
       e.printStackTrace()
     } finally {

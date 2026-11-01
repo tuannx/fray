@@ -2,6 +2,7 @@ package org.pastalab.fray.core
 
 import java.io.FileOutputStream
 import java.io.PrintStream
+import java.util.function.Consumer
 import kotlin.io.path.div
 import org.pastalab.fray.core.command.Configuration
 import org.pastalab.fray.core.delegates.DelegateSynchronizer
@@ -9,6 +10,12 @@ import org.pastalab.fray.core.delegates.RuntimeDelegate
 import org.pastalab.fray.runtime.Runtime
 
 class TestRunner(val config: Configuration) {
+  private var onContextCreated: Consumer<RunContext>? = null
+
+  /** Opt-in observation for isolated-process callers; the original constructor is unchanged. */
+  constructor(config: Configuration, onContextCreated: Consumer<RunContext>) : this(config) {
+    this.onContextCreated = onContextCreated
+  }
 
   var currentDivision = 1
   val stdout = System.out
@@ -55,9 +62,18 @@ class TestRunner(val config: Configuration) {
           config.executionInfo.executor.execute(config.resetClassLoader)
         } catch (e: Throwable) {}
       } else {
+        var contextObserverFailure: Throwable? = null
         val t =
             Thread({
               val context = RunContext(config)
+              try {
+                onContextCreated?.accept(context)
+              } catch (failure: Throwable) {
+                // The observer runs before Fray installs delegates; do not reset host delegates.
+                context.executor.stopHelperThread()
+                contextObserverFailure = failure
+                return@Thread
+              }
               val out = System.out
               val err = System.err
               try {
@@ -80,6 +96,7 @@ class TestRunner(val config: Configuration) {
             })
         t.start()
         t.join()
+        contextObserverFailure?.let { throw it }
       }
       if (
           config.isReplay ||

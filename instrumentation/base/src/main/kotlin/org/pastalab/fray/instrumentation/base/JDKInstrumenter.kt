@@ -67,6 +67,7 @@ fun instrumentClass(path: String, inputStream: InputStream): ByteArray {
     cv = StampedLockInstrumenter(cv)
     cv = CountDownLatchInstrumenter(cv)
     cv = MethodHandleNativesInstrumenter(cv)
+    cv = MethodTypeCacheInstrumenter(cv)
     cv = TimedWaitInstrumenter(cv)
     cv = ThreadLocalRandomInstrumenter(cv)
     cv =

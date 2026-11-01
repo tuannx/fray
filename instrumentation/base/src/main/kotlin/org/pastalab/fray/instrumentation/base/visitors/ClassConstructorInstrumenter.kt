@@ -4,7 +4,11 @@ import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes.ASM9
 
-class ClassConstructorInstrumenter(cv: ClassVisitor, val isJDK: Boolean) : ClassVisitor(ASM9, cv) {
+class ClassConstructorInstrumenter(
+    cv: ClassVisitor,
+    val isJDK: Boolean,
+    val experimentalSkipPrimitive: Boolean = false,
+) : ClassVisitor(ASM9, cv) {
   var className = ""
 
   override fun visit(
@@ -35,7 +39,8 @@ class ClassConstructorInstrumenter(cv: ClassVisitor, val isJDK: Boolean) : Class
       val eMv =
           MethodEnterVisitor(
               mv,
-              org.pastalab.fray.runtime.Runtime::onSkipScheduling,
+              if (experimentalSkipPrimitive) org.pastalab.fray.runtime.Runtime::onSkipPrimitive
+              else org.pastalab.fray.runtime.Runtime::onSkipScheduling,
               access,
               name,
               descriptor,
@@ -45,7 +50,8 @@ class ClassConstructorInstrumenter(cv: ClassVisitor, val isJDK: Boolean) : Class
           )
       return MethodExitVisitor(
           eMv,
-          org.pastalab.fray.runtime.Runtime::onSkipSchedulingDone,
+          if (experimentalSkipPrimitive) org.pastalab.fray.runtime.Runtime::onSkipPrimitiveDone
+          else org.pastalab.fray.runtime.Runtime::onSkipSchedulingDone,
           access,
           name,
           descriptor,

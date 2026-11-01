@@ -36,6 +36,7 @@ import org.pastalab.fray.core.concurrency.operations.*
 import org.pastalab.fray.core.concurrency.operations.InterruptionType
 import org.pastalab.fray.core.controllers.RunFinishedHandler
 import org.pastalab.fray.core.controllers.TimeController
+import org.pastalab.fray.core.observers.ExperimentalParkTrace
 import org.pastalab.fray.core.scheduler.FrayIdeaPluginScheduler
 import org.pastalab.fray.core.utils.HelperThread
 import org.pastalab.fray.core.utils.SynchronizationManager
@@ -337,24 +338,36 @@ class RunContext(val config: Configuration) {
       val spuriousWakeup = config.scheduler.nextInt() % 2 == 0
       // We only enable spurious wakeup in testing mode.
       if (spuriousWakeup && config.scheduler !is FrayIdeaPluginScheduler) {
+        if (ExperimentalParkTrace.enabled)
+            ExperimentalParkTrace.event(this, "SPURIOUS", "blockedUntil=$blockedUntil")
         context.pendingOperation = ThreadResumeOperation(true)
         context.state = ThreadState.Runnable
       } else {
+        if (ExperimentalParkTrace.enabled)
+            ExperimentalParkTrace.event(this, "PARK_BLOCK", "blockedUntil=$blockedUntil")
         context.pendingOperation = ParkBlocked(blockedUntil, context)
         context.state = ThreadState.Blocked
         scheduleNextOperation(true)
       }
     } else if (context.unparkSignaled) {
+      if (ExperimentalParkTrace.enabled) ExperimentalParkTrace.event(this, "CONSUME_UNPARK")
       context.unparkSignaled = false
+    } else {
+      if (ExperimentalParkTrace.enabled)
+          ExperimentalParkTrace.event(this, "INTERRUPT_ALREADY_SIGNALED")
     }
   }
 
   fun threadUnpark(t: Thread) = verifyNoThrow {
     val context = registeredThreads[t.id]
     if (context?.state == ThreadState.Blocked && context?.pendingOperation is ParkBlocked) {
+      if (ExperimentalParkTrace.enabled)
+          ExperimentalParkTrace.event(this, "UNPARK_BLOCKED", "target=${context.index}")
       context.state = ThreadState.Runnable
       context.pendingOperation = ThreadResumeOperation(true)
     } else if (context?.state == ThreadState.Runnable || context?.state == ThreadState.Running) {
+      if (ExperimentalParkTrace.enabled)
+          ExperimentalParkTrace.event(this, "UNPARK_PERMIT", "target=${context.index}")
       context.unparkSignaled = true
     }
   }
@@ -1113,6 +1126,13 @@ class RunContext(val config: Configuration) {
       val op = it.pendingOperation
       if (op is BlockedOperation && op.blockedUntil != BLOCKED_OPERATION_NOT_TIMED) {
         if (config.ignoreTimedBlock || op.blockedUntil <= currentTime) {
+          if (ExperimentalParkTrace.enabled && op is ParkBlocked) {
+            ExperimentalParkTrace.event(
+                this,
+                "TIMEOUT",
+                "target=${it.index} blockedUntil=${op.blockedUntil} comparedMillis=$currentTime ignoreTimed=${config.ignoreTimedBlock}",
+            )
+          }
           // If the thread is blocked by sleep operation, unblock it.
           op.unblockThread(it.thread.id, InterruptionType.TIMEOUT)
         } else {
