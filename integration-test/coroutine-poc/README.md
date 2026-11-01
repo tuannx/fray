@@ -16,8 +16,8 @@ and `JDK11` to a JDK 11 installation if Gradle cannot discover one.
 
 ```sh
 python3 integration-test/coroutine-poc/run.py baseline --timeout 90
-python3 integration-test/coroutine-poc/run.py mutex --timeout 90
-python3 integration-test/coroutine-poc/run.py race --timeout 90
+python3 integration-test/coroutine-poc/run.py mutex --timeout 75
+python3 integration-test/coroutine-poc/run.py race --timeout 75
 python3 integration-test/coroutine-poc/run.py baseline --memory --timeout 90
 ```
 
@@ -42,3 +42,34 @@ STDLIB_JAR=$(find "$CACHE/org.jetbrains.kotlin/kotlin-stdlib/2.2.21" -name '*.ja
 ```
 
 The control runs only the baseline and mutex workloads; it does not test Fray or the race probe.
+
+## Validation results
+
+The following commands ran from the repository root with JDK 25 as `JAVA_HOME` and `JDK25`,
+JDK 11 as `JDK11`, and a populated, isolated `GRADLE_USER_HOME`. They used the versions listed
+above; `--offline` requires the dependencies to be cached.
+
+```sh
+./gradlew --offline --no-daemon :integration-test:test \
+  --tests org.pastalab.fray.test.FrayTestCase.testOne \
+  :core:test --tests org.pastalab.fray.core.scheduler.ReplaySchedulerTest
+./gradlew --offline --no-daemon :integration-test:spotlessCheck :core:test
+```
+
+The selected integration regression completed 1/1 and the selected replay scheduler tests
+completed 2/2; the integration test does not assert the runner's result, and the scheduler tests
+do not demonstrate coroutine replay. The second command passed formatting and all 14 core tests.
+
+The broader integration command below was stopped by an external 120-second deadline, including
+Gradle startup (exit 124). Before interruption, two network fixtures,
+`AsyncClientConnectNoServerException` and `SyncClientExceptionWithoutServer`, failed because the
+runner returned null where an exception was expected. No final test count or fresh XML was
+available. The causes of these failures and of the coroutine timeouts are unknown; their relationship
+to this POC has not been established. The full repository build/check was not run.
+
+```sh
+./gradlew --offline --no-daemon :integration-test:test
+```
+
+These results do not establish race detection or replay for coroutines, or support for Android
+or Kotlin/Native.
