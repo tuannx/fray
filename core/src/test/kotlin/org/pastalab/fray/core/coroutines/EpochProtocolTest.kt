@@ -5,10 +5,14 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.jar.JarEntry
+import java.util.jar.JarOutputStream
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.jupiter.api.io.TempDir
@@ -77,6 +81,7 @@ class EpochProtocolTest {
 
   private fun manifest() =
       ReplayManifest(
+          schema = REPLAY_SCHEMA,
           entrypoint = entry,
           seed = 1,
           classpathDigest = shaA,
@@ -139,6 +144,7 @@ class EpochProtocolTest {
     for (changed in
         listOf(
             manifest().copy(schema = 3),
+            manifest().copy(schema = 4),
             manifest().copy(childClasspathDigest = shaA),
             manifest().copy(appJarSha256 = shaB),
             manifest().copy(appClasses = mapOf("example/Workload" to shaB)),
@@ -152,6 +158,8 @@ class EpochProtocolTest {
           EpochProtocolValidator.validate(request, bug.copy(manifest = changed), 10).status,
       )
     }
+    val noSchema = Json.encodeToString(manifest()).replaceFirst("\"schema\":5,", "")
+    assertFails { Json.decodeFromString<ReplayManifest>(noSchema) }
     assertEquals(
         EpochStatus.INCONCLUSIVE,
         EpochProtocolValidator.validate(request.copy(cooperativeInputs = null), bug, 10).status,
@@ -414,6 +422,153 @@ class EpochProtocolTest {
         backend.processPolicyDigest(384, 4, mapOf("TZ" to "UTC")) ==
             backend.processPolicyDigest(384, 4, mapOf("TZ" to "Europe/London"))
     )
+  }
+
+  @Test
+  fun changedJdkNativeLibraryRejectsReplayBeforeChildLaunch() {
+    fun write(name: String, contents: String): Path {
+      val path = temp.resolve(name)
+      Files.createDirectories(path.parent)
+      return Files.writeString(path, contents)
+    }
+    fun pin(path: Path): PinnedFile =
+        PinnedFile(
+            path,
+            MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(path)).joinToString("") {
+              "%02x".format(it.toInt() and 0xff)
+            },
+        )
+    fun jar(name: String, worker: Boolean = false): Path {
+      val path = temp.resolve(name)
+      JarOutputStream(Files.newOutputStream(path)).use { out ->
+        if (worker) {
+          out.putNextEntry(JarEntry("org/pastalab/fray/core/coroutines/CoroutineEpochWorker.class"))
+          out.write(1)
+          out.closeEntry()
+        }
+      }
+      return path
+    }
+
+    val marker = temp.resolve("child-was-launched")
+    val java = write("jdk/bin/java", "#!/bin/sh\nprintf 'started' > '$marker'\n")
+    assertTrue(java.toFile().setExecutable(true))
+    val modules = write("jdk/lib/modules", "modules")
+    val native = write("jdk/lib/server/libjvm.so", "native-A")
+    val agent = write("agent.jar", "agent")
+    val jvmti = write("jvmti.so", "jvmti")
+    val worker = jar("worker.jar", true)
+    val stdlib = jar("stdlib.jar")
+    val coroutine = jar("coroutines.jar")
+    val app = jar("app.jar")
+    val spec =
+        EpochRuntimeSpec(
+            pin(java),
+            pin(modules),
+            pin(agent),
+            pin(jvmti),
+            listOf(worker, stdlib, coroutine, app).map(::pin),
+        )
+    val method =
+        MethodExecutor(
+            entry.className,
+            entry.methodName,
+            emptyList(),
+            spec.jars.map { it.path.toString() },
+            emptyMap(),
+        )
+    val appInputs =
+        CooperativeExecutionInputs(
+            app.toString(),
+            spec.jars.last().sha256,
+            inputs.appClasses,
+            stdlib.toString(),
+            coroutine.toString(),
+        )
+    val probe = CoroutineEpochBackend(temp.resolve("before"))
+    val imageDigest =
+        JdkImageFingerprint.digest(
+            java.parent.parent,
+            System.nanoTime() + TimeUnit.SECONDS.toNanos(10),
+        )
+    val environment =
+        System.getenv().filterKeys {
+          it in setOf("LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "SYSTEMROOT", "WINDIR")
+        }
+    val recording =
+        manifest()
+            .copy(
+                classpathDigest = probe.digestOf(spec.jars.map { it.sha256 }),
+                childClasspathDigest = probe.digestOf(spec.jars.dropLast(1).map { it.sha256 }),
+                appJarSha256 = appInputs.appJarSha256,
+                appClasses = appInputs.appClasses,
+                runtimeDigest = probe.runtimeDigest(spec, imageDigest),
+                processPolicyDigest =
+                    probe.processPolicyDigest(spec.maxHeapMb, spec.activeProcessors, environment),
+            )
+    val replay =
+        ReplayInput(
+            recording,
+            temp.resolve("missing-schedule"),
+            temp.resolve("missing-random"),
+            temp.resolve("missing-state"),
+        )
+    // Valid identity gets as far as making the recording directory, then stops on missing files.
+    assertEquals(
+        EpochStatus.INCONCLUSIVE,
+        probe.run(method, true, 1, spec, 30_000, replay, expected, appInputs).status,
+    )
+    Files.list(temp.resolve("before")).use { dirs ->
+      assertTrue(dirs.anyMatch { Files.isDirectory(it.resolve("recording")) })
+    }
+    assertFalse(Files.exists(marker))
+
+    val legacy = CoroutineEpochBackend(temp.resolve("legacy"))
+    assertEquals(
+        EpochStatus.UNSUPPORTED,
+        legacy
+            .run(
+                method,
+                true,
+                1,
+                spec,
+                30_000,
+                replay.copy(manifest = recording.copy(schema = 4)),
+                expected,
+                appInputs,
+            )
+            .status,
+    )
+    assertFalse(Files.exists(temp.resolve("legacy")))
+    assertFalse(Files.exists(marker))
+
+    // The launcher and modules remain byte-for-byte unchanged; the different libjvm must reject
+    // the old manifest before artifact copying and before invoking the fake launcher.
+    Files.writeString(native, "native-B")
+    val after = CoroutineEpochBackend(temp.resolve("after"))
+    assertEquals(
+        EpochStatus.INCONCLUSIVE,
+        after.run(method, true, 1, spec, 30_000, replay, expected, appInputs).status,
+    )
+    Files.list(temp.resolve("after")).use { dirs ->
+      assertFalse(dirs.anyMatch { Files.exists(it.resolve("recording")) })
+    }
+    assertFalse(Files.exists(marker))
+
+    // A child which changes a non-launcher JDK component must be rejected by the post-run scan,
+    // before an absent/malformed response can be treated as its only failure.
+    val childMarker = temp.resolve("mutator-ran")
+    Files.writeString(
+        java,
+        "#!/bin/sh\nprintf 'native-C' > '$native'\nprintf 'yes' > '$childMarker'\n",
+    )
+    assertTrue(java.toFile().setExecutable(true))
+    val mutatingSpec = spec.copy(java = pin(java))
+    val postRun = CoroutineEpochBackend(temp.resolve("post-run"))
+    val outcome = postRun.run(method, true, 1, mutatingSpec, 30_000)
+    assertTrue(Files.exists(childMarker))
+    assertEquals(EpochStatus.INCONCLUSIVE, outcome.status)
+    assertEquals("Pinned runtime changed or could not be verified", outcome.reason)
   }
 
   @Test

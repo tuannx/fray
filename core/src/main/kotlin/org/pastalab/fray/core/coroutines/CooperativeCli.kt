@@ -7,6 +7,7 @@ import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -212,6 +213,9 @@ internal class CooperativeCliRunner(private val execute: CliEpochExecutor? = nul
             val manifestPath = regularFile(dir.resolve("manifest.json"))
             val manifest =
                 json.decodeFromString<ReplayManifest>(boundedText(manifestPath, MAX_CONFIG_BYTES))
+            require(manifest.schema == REPLAY_SCHEMA) {
+              "Unsupported replay manifest schema; version $REPLAY_SCHEMA is required"
+            }
             require(
                 config.expectedFailure == null || config.expectedFailure == manifest.expectedFailure
             ) {
@@ -238,6 +242,8 @@ internal class CooperativeCliRunner(private val execute: CliEpochExecutor? = nul
       val outputParent = requireNotNull(requestedOutput.parent).toRealPath()
       require(Files.isDirectory(outputParent)) { "Output parent must exist" }
       val output = outputParent.resolve(requestedOutput.fileName.toString())
+      val jdkImage = java.path.toRealPath().parent.parent
+      JdkImageFingerprint.requireDisjoint(jdkImage, output)
       val sourceFiles =
           listOf(configPath, java.path, modules.path, agent.path, jvmti.path, app.path) +
               runtimeJars.map { it.path }
@@ -248,6 +254,23 @@ internal class CooperativeCliRunner(private val execute: CliEpochExecutor? = nul
       ) {
         "Output overlaps an input"
       }
+      // The first scan is part of the first seed's budget. Each later seed rechecks the same
+      // campaign identity, and the backend independently scans before and after each child.
+      val firstDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.timeoutMillis)
+      val campaignImage =
+          try {
+            JdkImageFingerprint.digest(jdkImage, firstDeadline)
+          } catch (_: Exception) {
+            return emit(
+                CliResult(
+                    EpochStatus.INCONCLUSIVE,
+                    "Could not fingerprint JDK image within deadline",
+                    0,
+                    0,
+                )
+            )
+          }
+      val campaignRuntime = runtime.copy(expectedJdkImageDigest = campaignImage)
       Files.createDirectory(output)
       val backend = CoroutineEpochBackend(output.resolve("scratch"))
       val launcher =
@@ -264,11 +287,30 @@ internal class CooperativeCliRunner(private val execute: CliEpochExecutor? = nul
               }
       val seeds = replay?.let { listOf(it.manifest.seed) } ?: config.seeds
       val expected = replay?.manifest?.expectedFailure ?: config.expectedFailure
-      for (seed in seeds) {
+      for ((index, seed) in seeds.withIndex()) {
         currentSeed = seed
         attempted++
+        val deadline =
+            if (index == 0) firstDeadline
+            else System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.timeoutMillis)
+        val remainingMillis =
+            try {
+              if (index != 0)
+                  JdkImageFingerprint.requireUnchanged(jdkImage, campaignImage, deadline)
+              TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).also { require(it > 0) }
+            } catch (_: Exception) {
+              return emit(
+                  CliResult(
+                      EpochStatus.INCONCLUSIVE,
+                      "JDK image changed or epoch deadline expired",
+                      attempted,
+                      completed,
+                      seed,
+                  )
+              )
+            }
         val outcome =
-            launcher.run(method, seed, runtime, config.timeoutMillis, replay, expected, inputs)
+            launcher.run(method, seed, campaignRuntime, remainingMillis, replay, expected, inputs)
         when (outcome.status) {
           EpochStatus.COMPLETED -> {
             if (replay != null)

@@ -130,6 +130,7 @@ class CooperativeCliTest {
         )
     val manifest =
         ReplayManifest(
+            schema = REPLAY_SCHEMA,
             entrypoint = config.entrypoint,
             seed = 2,
             classpathDigest = "a".repeat(64),
@@ -198,6 +199,28 @@ class CooperativeCliTest {
   }
 
   @Test
+  fun campaignStopsBeforeNextSeedIfJdkImageChanges() {
+    val cfg = config(out = "changed-image", seeds = listOf(1, 2))
+    val native = file("jdk/lib/server/libjvm.so", "native-A")
+    val seen = mutableListOf<Long>()
+    val result =
+        call(
+            cfg,
+            CliEpochExecutor { _, seed, runtime, _, _, _, _ ->
+              assertTrue(runtime.expectedJdkImageDigest?.matches(Regex("[0-9a-f]{64}")) == true)
+              seen.add(seed)
+              if (seed == 1L) Files.writeString(native, "native-B")
+              EpochOutcome(EpochStatus.COMPLETED, "complete")
+            },
+        )
+    assertEquals(30, result.code)
+    assertEquals("INCONCLUSIVE", result.result().getValue("status").jsonPrimitive.content)
+    assertEquals(2, result.result().getValue("attempted").jsonPrimitive.int)
+    assertEquals(1, result.result().getValue("completed").jsonPrimitive.int)
+    assertEquals(listOf(1L), seen)
+  }
+
+  @Test
   fun invalidConfigAndExistingOutputNeverInvokeExecutorOrOverwrite() {
     var calls = 0
     val fake = CliEpochExecutor { _, _, _, _, _, _, _ ->
@@ -225,6 +248,23 @@ class CooperativeCliTest {
     val existing = config(out = "existing-output")
     assertTrue(call(existing, fake).code != 0)
     assertEquals("untouched", Files.readString(sentinel))
+    assertEquals(0, calls)
+  }
+
+  @Test
+  fun outputInsideJdkImageIsRejectedBeforeDirectoryCreationOrLaunch() {
+    var calls = 0
+    val fake = CliEpochExecutor { _, _, _, _, _, _, _ ->
+      calls++
+      EpochOutcome(EpochStatus.COMPLETED, "complete")
+    }
+    val cfg = config(out = "jdk/results")
+    assertEquals(20, call(cfg, fake).code)
+    assertFalse(Files.exists(Path.of(cfg.outputDirectory)))
+    val alias = Files.createSymbolicLink(temp.resolve("jdk-alias"), temp.resolve("jdk"))
+    val viaAlias = cfg.copy(outputDirectory = alias.resolve("results").toString())
+    assertEquals(20, call(viaAlias, fake).code)
+    assertFalse(Files.exists(Path.of(viaAlias.outputDirectory)))
     assertEquals(0, calls)
   }
 
@@ -263,6 +303,30 @@ class CooperativeCliTest {
         }
     assertEquals(20, exit)
     assertEquals(0, calls)
+  }
+
+  @Test
+  fun legacyReplaySchemaIsRejectedBeforeOutputOrExecutor() {
+    val cfg = config(out = "legacy-replay")
+    val fixture = replayFixture(cfg)
+    Files.writeString(
+        fixture.directory.resolve("manifest.json"),
+        json.encodeToString(fixture.manifest.copy(schema = 4)),
+    )
+    var calls = 0
+    val result =
+        call(
+            cfg,
+            CliEpochExecutor { _, _, _, _, _, _, _ ->
+              calls++
+              EpochOutcome(EpochStatus.COMPLETED, "complete")
+            },
+            "replay",
+            fixture.directory,
+        )
+    assertEquals(20, result.code)
+    assertEquals(0, calls)
+    assertFalse(Files.exists(Path.of(cfg.outputDirectory)))
   }
 
   @Test

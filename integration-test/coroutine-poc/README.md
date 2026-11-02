@@ -3,7 +3,9 @@
 This is an opt-in investigation, not a claim that Fray supports Kotlin coroutines. The probes use
 `runBlocking` and the real `Dispatchers.Default` with `async` or `launch`, plus an intentional
 shared counter race and a `Mutex`-protected counterpart. Android ART, Kotlin/Native, JS and Wasm
-are outside its scope. Race detection and coroutine replay have **not** been demonstrated.
+are outside its scope. These non-isolated probes have not demonstrated race detection or coroutine
+replay. A newer disposable-worker experiment found and replayed one controlled race; see
+[the lab report](../../EXPERIMENT.md) for its results and limits.
 
 Kotlin is a language; Kotlin/JVM produces JVM code. A suspending function is compiled using
 continuations and a state machine, and can resume on a different thread. `Dispatchers.Default` uses
@@ -82,20 +84,21 @@ The environment was macOS arm64, Corretto 25.0.1, Gradle 9.0.0, Kotlin 2.2.21 an
   support. The experiment was not a complete successful Fray test.
 
 The diagnostic observations identify several distinct interactions; they do not establish the
-root cause of every timeout. The next design decision is how Fray should model and safely retire
-or isolate shared dispatcher workers across iterations while preserving scheduling and replay.
+root cause of every timeout. A newer experiment uses a disposable worker per iteration, with
+bounded results and remaining lifecycle and replay limitations described in the lab report.
 
-## Focused fixes and checks
+## Historical focused fixes and checks
 
-The current change guards Fray's thread-bookkeeping lookup against reentrant scheduling. Its
-focused unit regression passed 1/1; the same test failed on the pre-fix runtime. It also applies
+The earlier change guarded Fray's thread-bookkeeping lookup against reentrant scheduling. Its
+focused unit regression passed 1/1; the same test failed on the pre-fix runtime. It also applied
 the existing class-initialization scheduling guard to `kotlinx.coroutines` initializers without
 enabling general coroutine-library instrumentation. Its bounded, deterministic regression passed
 1/1; the pre-fix reproduction timed out. These fixes address the measured mechanisms; they do not
 resolve the shared dispatcher lifecycle or establish coroutine support. After both fixes, the
 corrected baseline command `python3 integration-test/coroutine-poc/run.py baseline --timeout 90`
 reached the test task and exited 124 at its external deadline, which included build time; it did
-not produce a completed test result.
+not produce a completed test result. These checks predate the later worker and ownership changes;
+they do not validate the current tree. See the lab report for later checks.
 
 ```sh
 ./gradlew --offline --no-daemon :core:test \
@@ -118,7 +121,7 @@ checks. The focused instrumentation command passed 2/2, covering explicit prefix
 normal and exceptional initializer exits; the full instrumentation base suite passed 5/5 without
 skips. The selected integration command passed 2/2 with no
 skips; `FrayTestCase.testOne` does
-not assert the runner's result. A current run of the aggregate integration command below reached
+not assert the runner's result. An aggregate integration run at that stage reached
 the tests but exited 124 at an external 120-second deadline, including startup. Partial output
 showed `AsyncClientConnectNoServerException` failing at `FrayTestCase.java:47`; there was no final
 count or fresh XML. Its cause is unknown.
@@ -147,4 +150,5 @@ The earlier run was stopped at an external
 interruption; there was no final count or fresh XML. Both failures also reproduced on unchanged
 upstream `e39d216` when `FrayTestCase.testCases` was stopped after a 240-second external deadline.
 Those fixtures expect no server at `localhost:12345`; a listener was observed during the test, but
-the root cause of the failures has not been proven. A full repository build/check was not run.
+the root cause of the failures has not been proven. A full repository build/check was not run at
+that stage; the lab report describes later checks.

@@ -7,6 +7,7 @@ import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
+import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -35,6 +36,10 @@ internal data class EpochRuntimeSpec(
     val jars: List<PinnedFile>,
     val maxHeapMb: Int = 384,
     val activeProcessors: Int = 4,
+    /**
+     * Optional campaign snapshot; every epoch still hashes the image before and after the child.
+     */
+    val expectedJdkImageDigest: String? = null,
 )
 
 internal data class ReplayInput(
@@ -46,8 +51,9 @@ internal data class ReplayInput(
 
 /**
  * Supervises exactly one disposable child per invocation. It is not yet integrated into Fray's
- * public test APIs. The current child deliberately returns UNSUPPORTED: admission, lifecycle,
- * replay verification and status reporting are not yet implemented there.
+ * public test APIs. The experimental child handles admitted workloads and can report COMPLETED,
+ * APPLICATION_BUG, UNSUPPORTED or INCONCLUSIVE subject to its admission, lifecycle and replay
+ * checks. This limited mode does not establish general coroutine support.
  *
  * A subprocess isolates Java references between epochs; it does not prevent filesystem/network side
  * effects or escape by arbitrary native code. The caller and child are trusted, and this is not a
@@ -118,6 +124,12 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
           "Expected application failure is missing or invalid",
       )
     }
+    if (replay != null && replay.manifest.schema != REPLAY_SCHEMA) {
+      return EpochOutcome(
+          EpochStatus.UNSUPPORTED,
+          "Unsupported replay manifest schema; version $REPLAY_SCHEMA is required",
+      )
+    }
     return try {
       runVerified(method, seed, runtime, timeoutMillis, replay, expectedFailure, cooperativeInputs)
     } catch (e: Exception) {
@@ -148,6 +160,16 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
     require(java.fileName.toString() == "java" && java.parent.fileName.toString() == "bin")
     require(modules == java.parent.parent.resolve("lib/modules").toRealPath())
     require(Files.isExecutable(java))
+    val jdkImage = java.parent.parent
+    JdkImageFingerprint.requireDisjoint(jdkImage, scratchRoot)
+    val imageDigest = JdkImageFingerprint.digest(jdkImage, deadline)
+    require(
+        runtime.expectedJdkImageDigest == null ||
+            (digestPattern.matches(runtime.expectedJdkImageDigest) &&
+                runtime.expectedJdkImageDigest == imageDigest)
+    ) {
+      "JDK image differs from the campaign snapshot"
+    }
     val jars = runtime.jars.map { it.path.toRealPath() }
     require(
         jars.distinct().size == jars.size && jars.all { it.fileName.toString().endsWith(".jar") }
@@ -185,15 +207,7 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
                 .filter { (_, path) -> path in childClasspath }
                 .map { (pin, _) -> pin.sha256 }
         )
-    val runtimeDigest =
-        digestOf(
-            listOf(
-                runtime.java.sha256,
-                runtime.modules.sha256,
-                runtime.agent.sha256,
-                runtime.jvmti.sha256,
-            )
-        )
+    val runtimeDigest = runtimeDigest(runtime, imageDigest)
     val childEnvironment = System.getenv().filterKeys { it in allowedEnvironment }
     require(
         childEnvironment.values.all {
@@ -210,7 +224,7 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
     if (replay != null) {
       val m = replay.manifest
       require(
-          m.schema == 4 &&
+          m.schema == REPLAY_SCHEMA &&
               frozenInputs != null &&
               EpochProtocolValidator.validAppInventory(m.appJarSha256, m.appClasses) &&
               m.appJarSha256 == frozenInputs.appJarSha256 &&
@@ -286,88 +300,123 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
     builder.environment().clear()
     builder.environment().putAll(childEnvironment)
     val child = builder.start()
+    var childExitConfirmed = false
+    var cleanupAttempted = false
     val diagnosticLog = epoch.resolve("worker.log")
     fun inconclusive(message: String) =
         EpochOutcome(EpochStatus.INCONCLUSIVE, message, diagnosticLog = diagnosticLog)
-    val overflow = AtomicBoolean(false)
-    val reader =
-        Thread(
-            {
-              try {
-                child.inputStream.use { stream ->
-                  Files.newOutputStream(diagnosticLog, StandardOpenOption.CREATE_NEW).use { output
-                    ->
-                    val buffer = ByteArray(4096)
-                    var total = 0
-                    while (true) {
-                      val count = stream.read(buffer)
-                      if (count < 0) break
-                      val accepted = minOf(count, MAX_OUTPUT_BYTES - total)
-                      if (accepted > 0) output.write(buffer, 0, accepted)
-                      total += accepted
-                      if (accepted != count) {
-                        overflow.set(true)
-                        child.destroyForcibly()
-                        break
+    fun abortChild(message: String): EpochOutcome {
+      cleanupAttempted = true
+      val cleanup = cleanupProcess(child, Duration.ofSeconds(2))
+      childExitConfirmed = cleanup.rootExited
+      val detail =
+          when {
+            !cleanup.rootExited -> "$message; worker termination was not confirmed"
+            cleanup.operationFailed -> "$message; worker stopped but cleanup reported an error"
+            else -> message
+          }
+      return inconclusive(detail)
+    }
+    try {
+      val overflow = AtomicBoolean(false)
+      val reader =
+          Thread(
+              {
+                guardOutputReader(overflow) {
+                  child.inputStream.use { stream ->
+                    Files.newOutputStream(diagnosticLog, StandardOpenOption.CREATE_NEW).use { output
+                      ->
+                      val buffer = ByteArray(4096)
+                      var total = 0
+                      while (true) {
+                        val count = stream.read(buffer)
+                        if (count < 0) break
+                        val accepted = minOf(count, MAX_OUTPUT_BYTES - total)
+                        if (accepted > 0) output.write(buffer, 0, accepted)
+                        total += accepted
+                        if (accepted != count) {
+                          overflow.set(true)
+                          child.destroyForcibly()
+                          break
+                        }
                       }
                     }
                   }
                 }
-              } catch (_: Exception) {
-                overflow.set(true)
-              }
-            },
-            "coroutine-epoch-output",
+              },
+              "coroutine-epoch-output",
+          )
+      reader.isDaemon = true
+      reader.start()
+      val remaining = deadline - System.nanoTime()
+      if (remaining <= 0) {
+        return abortChild("Child exceeded epoch deadline")
+      }
+      val exited =
+          try {
+            child.waitFor(remaining, TimeUnit.NANOSECONDS)
+          } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return abortChild("Interrupted while waiting for child")
+          }
+      if (!exited) {
+        return abortChild("Child exceeded epoch deadline")
+      }
+      childExitConfirmed = true
+      try {
+        val readRemainingMillis =
+            TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceIn(1, 2_000)
+        reader.join(readRemainingMillis)
+      } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return inconclusive("Interrupted while reading child output")
+      }
+      if (reader.isAlive || overflow.get())
+          return inconclusive("Child output was not safely bounded")
+      try {
+        pinned.forEach { verifyPinnedFile(it, deadline) }
+        JdkImageFingerprint.requireUnchanged(jdkImage, imageDigest, deadline)
+      } catch (_: Exception) {
+        return inconclusive(
+            if (System.nanoTime() >= deadline)
+                "Epoch deadline exceeded during post-run verification"
+            else "Pinned runtime changed or could not be verified"
         )
-    reader.isDaemon = true
-    reader.start()
-    val remaining = deadline - System.nanoTime()
-    if (remaining <= 0) {
-      stopChild(child)
-      return inconclusive("Child exceeded epoch deadline")
+      }
+      val response =
+          try {
+            readResponse(result)
+          } catch (_: Exception) {
+            return inconclusive("Child response missing or malformed")
+          }
+      val outcome = EpochProtocolValidator.validate(request, response, child.exitValue())
+      if (
+          outcome.status == EpochStatus.APPLICATION_BUG &&
+              !verifyArtifacts(epoch, response.manifest!!, deadline)
+      ) {
+        return inconclusive("Replay artifact missing, changed or too large")
+      }
+      return if (outcome.status == EpochStatus.APPLICATION_BUG)
+          outcome.copy(
+              artifactDirectory = epoch.resolve("recording"),
+              diagnosticLog = diagnosticLog,
+          )
+      else outcome.copy(diagnosticLog = diagnosticLog)
+    } catch (error: Exception) {
+      return when {
+        childExitConfirmed ->
+            inconclusive("Worker verification failed: ${error.javaClass.simpleName}")
+        cleanupAttempted -> inconclusive("Worker cleanup failed; termination was not confirmed")
+        else -> abortChild("Worker execution failed: ${error.javaClass.simpleName}")
+      }
+    } finally {
+      // Covers exceptions after start, including reader-thread creation failure. Do not enumerate
+      // descendants by a PID that may have been recycled; supported workloads cannot spawn OS
+      // processes.
+      if (!childExitConfirmed && !cleanupAttempted) {
+        runCatching { cleanupProcess(child, Duration.ofSeconds(2)) }
+      }
     }
-    val exited =
-        try {
-          child.waitFor(remaining, TimeUnit.NANOSECONDS)
-        } catch (e: InterruptedException) {
-          stopChild(child)
-          Thread.currentThread().interrupt()
-          return inconclusive("Interrupted while waiting for child")
-        }
-    if (!exited) {
-      stopChild(child)
-      return inconclusive("Child exceeded epoch deadline")
-    }
-    try {
-      val readRemainingMillis =
-          TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceIn(1, 2_000)
-      reader.join(readRemainingMillis)
-    } catch (e: InterruptedException) {
-      Thread.currentThread().interrupt()
-      return inconclusive("Interrupted while reading child output")
-    }
-    if (reader.isAlive || overflow.get()) return inconclusive("Child output was not safely bounded")
-    try {
-      pinned.forEach { verifyPinnedFile(it, deadline) }
-    } catch (_: Exception) {
-      return inconclusive("Pinned runtime changed or deadline expired")
-    }
-    val response =
-        try {
-          readResponse(result)
-        } catch (_: Exception) {
-          return inconclusive("Child response missing or malformed")
-        }
-    val outcome = EpochProtocolValidator.validate(request, response, child.exitValue())
-    if (
-        outcome.status == EpochStatus.APPLICATION_BUG &&
-            !verifyArtifacts(epoch, response.manifest!!, deadline)
-    ) {
-      return inconclusive("Replay artifact missing, changed or too large")
-    }
-    return if (outcome.status == EpochStatus.APPLICATION_BUG)
-        outcome.copy(artifactDirectory = epoch.resolve("recording"), diagnosticLog = diagnosticLog)
-    else outcome.copy(diagnosticLog = diagnosticLog)
   }
 
   private fun readResponse(path: Path): EpochResponse {
@@ -420,7 +469,7 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
                 }
         )
         require(
-            manifest.schema == 4 &&
+            manifest.schema == REPLAY_SCHEMA &&
                 EpochProtocolValidator.validAppInventory(
                     manifest.appJarSha256,
                     manifest.appClasses,
@@ -470,17 +519,6 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
         false
       }
 
-  private fun stopChild(child: Process) {
-    // Only descendants of the process created above are touched. No process-name based killing.
-    runCatching { child.descendants().use { stream -> stream.forEach { it.destroyForcibly() } } }
-    child.destroyForcibly()
-    try {
-      child.waitFor(2, TimeUnit.SECONDS)
-    } catch (e: InterruptedException) {
-      Thread.currentThread().interrupt()
-    }
-  }
-
   private fun verifyPinnedFile(file: PinnedFile, deadline: Long) {
     require(
         digestPattern.matches(file.sha256) &&
@@ -490,7 +528,7 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
     require(sha256(file.path, 2L * 1024 * 1024 * 1024, deadline) == file.sha256)
   }
 
-  private fun digestOf(values: List<String>): String {
+  internal fun digestOf(values: List<String>): String {
     val digest = MessageDigest.getInstance("SHA-256")
     for (value in values) {
       val bytes = value.toByteArray(StandardCharsets.UTF_8)
@@ -499,6 +537,18 @@ internal class CoroutineEpochBackend(private val scratchRoot: Path) {
     }
     return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
   }
+
+  internal fun runtimeDigest(runtime: EpochRuntimeSpec, imageDigest: String): String =
+      digestOf(
+          listOf(
+              "fray-runtime-with-jdk-image-v1",
+              imageDigest,
+              runtime.java.sha256,
+              runtime.modules.sha256,
+              runtime.agent.sha256,
+              runtime.jvmti.sha256,
+          )
+      )
 
   /**
    * Includes every fixed JVM flag and worker entrypoint; change the version when policy changes.

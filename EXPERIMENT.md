@@ -7,6 +7,22 @@ race. An experimental opt-in CLI is available; see [CLI setup and supported
 contract](docs/cooperative-cli.md). Trusted runtime distribution and broader
 validation remain unfinished; these results do not establish general coroutine support.
 
+Replay schema 5 fingerprints the whole observed JDK image before and after each child and requires
+the same image across a CLI seed campaign. Its bounded identity includes paths, entry types, file
+bytes, POSIX permissions, owner/group names and modification times; relative symlinks must remain
+within the image.
+Changing timestamps, including by copying without preservation, can invalidate replay. Schema 4
+recordings and manifests without an explicit schema are rejected and must be re-recorded. This is
+an identity check, not independent authentication: OS libraries, CPU state, ACLs and
+extended attributes are not bound, and the caller must keep inputs trusted and immutable throughout
+the run because replace-and-restore races can escape pre/post checks.
+
+Backend cleanup verifies the direct worker only, not arbitrary descendants; cooperative workloads
+exclude operating-system process creation. The lab watchdog's process-group `SIGKILL` is best effort:
+descendants that change group/session and uninterruptible processes are not guaranteed to stop.
+The signal is asynchronous, and cleanup is not guaranteed if the watchdog itself is killed or
+crashes. Neither mechanism is a security sandbox.
+
 The remaining blockers include independently authenticated framework/runtime inputs,
 unsupported coroutine features, and unexplored workloads and replay cases.
 Android ART, Kotlin/Native, JS and Wasm are outside this work.
@@ -32,7 +48,8 @@ Gradle 9.0.0, Kotlin 2.2.21 and kotlinx-coroutines-core 1.10.1.
 
 | Check | Result and evidence |
 | --- | --- |
-| Full repository `check` | Passed on repeat in 57 seconds; 19 tasks executed and 165 were up-to-date from the preceding run, which reached IntelliJ plugin tasks before its 240-second watchdog. `ownership-gate-full-check-repeat.log` |
+| Full repository `check`, schema 5 | Passed in 4m18s; 13 tasks executed, 171 up-to-date. Core 106 passed/2 skipped, instrumentation 92 passed, integration 77 passed/23 skipped, JUnit 16 passed/3 skipped. `fix-full-check.log` |
+| Earlier full repository `check` | Passed on repeat in 57 seconds; 19 tasks executed and 165 up-to-date from a preceding run. `ownership-gate-full-check-repeat.log` |
 | Ownership regression | The new focused test failed before the fix and passed after it; both publication tests passed. `legacy-ownership-regression-red.log`, `ownership-gate-focused.log` |
 | Fixed JUnit | 16 passed, 3 skipped, twice in fresh workers with a rebuilt JDK. `ownership-gate-junit-run1.log`, `ownership-gate-junit-run2.log` |
 | Core and instrumentation after fix | Core 89 passed / 2 skipped; instrumentation 92 passed, including the new gate tests. `ownership-gate-full-check.log` |
@@ -41,14 +58,24 @@ Gradle 9.0.0, Kotlin 2.2.21 and kotlinx-coroutines-core 1.10.1.
 | Fresh child baseline and Mutex, Nov 1 12:05 | 10/10 baseline and 10/10 Mutex passed; admission fixture 2/2 and selected Java regression 1/1 passed. `generation-fresh-v1-xml` |
 | Seeded fresh child cases, Nov 1 12:07 | 20/20 baseline and 20/20 Mutex passed with seeds 1–20. Each selected case used one iteration in a fresh child. `generation-seeded-v1.xml` |
 | Initial actual worker | Baseline and Mutex each completed once in separate JVMs; host-bridge and non-entry class-shadow negatives were rejected. This first run supplied an extra ASM JAR for a packaging gap, which is being corrected. `worker-e2e-v5.xml` |
-| Worker and CLI, final source tree | Two opt-in JUnit tests passed: baseline and Mutex each completed 10/10 fresh child JVMs, seed 74231 found one expected race and replayed 5/5 times in fresh JVMs with strict trace, random stream and artifact checks. The actual CLI completed baseline and discovery/persist/replay, and refused output reuse. `ownership-gate-worker-xml` |
+| Worker and CLI, schema 5 | Two opt-in tests passed in 2m30s: baseline and Mutex 10/10 each; seed 74231 found one expected race and replayed 5/5 times in fresh JVMs. CLI discovery/replay and negative controls passed. `fix-worker-e2e-final-results` |
+| Worker and CLI, rebuilt JDK image | Baseline and Mutex each completed once; race and strict replay each completed once, with CLI discovery/replay, in 42s. `fix-worker-final-jdk-results` |
+| Worker and CLI, earlier schema 4 tree | Two opt-in JUnit tests passed: baseline and Mutex each completed 10/10 fresh child JVMs, seed 74231 found one expected race and replayed 5/5 times in fresh JVMs with strict trace, random stream and artifact checks. The actual CLI completed baseline and discovery/persist/replay, and refused output reuse. `ownership-gate-worker-xml` |
 | Worker, packaged runtime | Baseline and Mutex each completed 10/10 fresh JVMs with seeds 1–10. A race found at seed 74231 replayed in five fresh JVMs; both strict verifiers and integer consumption passed, original artifacts stayed unchanged, and host-bridge, non-entry shadow and truncated-trace controls were rejected. `worker-full-e2e-v2-xml` |
-| Worker cancellation and suspension | The selected structured cancellation case completed with teardown; detached `GlobalScope` was rejected. The suspended case was `INCONCLUSIVE` after runner start; its exact suspension point was not observed. `ownership-gate-worker-xml` |
-| Strict loader with real agent | Six synthetic child tests passed, including real field read/write hooks and rejection of absent agent, excluded class, unknown class, early boundary and wrong digest. `ownership-gate-strict-agent.xml` |
+| Worker cancellation and suspension, schema 5 | The selected structured cancellation case completed with teardown; detached `GlobalScope` was rejected. The suspended case was `INCONCLUSIVE` after runner start; its exact suspension point was not observed. `fix-worker-e2e-final-results` |
+| Strict loader with real agent, schema 5 tree | Six synthetic child tests passed, including real field read/write hooks and rejection of absent agent, excluded class, unknown class, early boundary and wrong digest. `fix-strict-agent.log` |
 | Race and boundaries | With partial symmetric framework bootstrap, the same seeded race was found and replayed in a fresh JVM 5/5 times; both strict trace verdicts and recorded integer consumption passed. Earlier preload-only replay failed 5/5 at index 9. Cancellation and three selected detached-job rejection tests passed (4/4). `symmetric-replay-v2.xml`, `generation-replay-preload-v1.xml` |
 | Earlier formatting check | Failed before formatting was applied; the later formatted lab validation passed. `generation-format-v1.log` |
 | Integration aggregate | 77 passed, 17 opt-in tests skipped, 0 failed in 20 seconds. The log contains `TargetTerminateException` uncaught-handler messages. `formatted-integration-aggregate-v1.log` |
 | Upstream network control, Nov 1 11:51 | Two selected network cases passed on the unchanged upstream control checkout. This does not establish why the earlier aggregate failed. `upstream-network-control.xml` |
+
+The first schema 5 end-to-end run passed its baseline, Mutex, replay and CLI
+checks but failed the suspended-work test: the old 5-second budget expired in
+post-run image verification. The test now allows 15 seconds and distinguishes a
+verification deadline from an image mismatch. Its final result still does not
+prove that the exact suspension site was reached. The watchdog regression suite
+passed 11/11 on macOS; it exercises timeout, surviving group children,
+cancellation, signal masks and an unrelated process group.
 
 The earlier full check first lacked the core fat JAR, then `:core:shadowJar check`
 failed at `:junit:test`. The first captured failure was a `StackOverflowError` in
@@ -161,8 +188,9 @@ The included watchdog `scripts/coroutine-lab-run.py`, the lab sources, both JDKs
 an already populated offline Gradle cache are required. Export `JDK25`, `JDK11`
 and `GRADLE_USER_HOME` to suit the machine. Raw evidence is in the adjacent
 `fray-lifecycle-evidence` directory; logs can contain local paths and should be
-reviewed and sanitized before sharing. The wrapper imposes a 240-second outer
-limit, including Gradle startup; each integration child has a 60-second limit.
+reviewed and sanitized before sharing. The commands below use a 240- or 300-second outer limit, including Gradle startup;
+most integration children have a 60-second limit. The suspended-work negative
+probe uses a 15-second limit that also covers image hashing.
 
 ```bash
 export JAVA_HOME="$JDK25"
@@ -188,7 +216,7 @@ FRAY_COOPERATIVE_SEEDS=1,2,3,4,5,6,7,8,9,10 \
 FRAY_COOPERATIVE_REPLAY=true FRAY_COOPERATIVE_REPLAY_COUNT=5 \
 FRAY_COOPERATIVE_CLI=true FRAY_COOPERATIVE_NEGATIVES=true \
 FRAY_COOPERATIVE_EVIDENCE_DIR="$PWD/../fray-lifecycle-evidence/worker-artifacts-repeat" \
-python3 scripts/coroutine-lab-run.py ../fray-lifecycle-evidence/worker-repeat.log 240 \
+python3 scripts/coroutine-lab-run.py ../fray-lifecycle-evidence/worker-repeat.log 300 \
   python3 scripts/cooperative-worker-test.py "${common[@]}" \
   :core:test --rerun --tests org.pastalab.fray.core.coroutines.CooperativeEpochIntegrationTest \
   --tests org.pastalab.fray.core.coroutines.CooperativeNegativeWorkerTest
@@ -197,7 +225,7 @@ python3 scripts/coroutine-lab-run.py ../fray-lifecycle-evidence/worker-repeat.lo
 The explicit `--rerun` matters: Gradle does not track these environment variables
 or the externally rebuilt JDK as test inputs. The wrapper pins the local dependency
 set for this experiment and excludes optional terminal providers. Set `FRAY_COOPERATIVE_NEGATIVES=true` and select
-`CooperativeNegativeWorkerTest` to run the separate 5-second watchdog and
+`CooperativeNegativeWorkerTest` to run the separate 15-second watchdog and
 cancellation/detached controls. A watchdog result alone does not prove the
 exact suspension point was reached.
 
@@ -221,7 +249,7 @@ timed-block control; diagnostic instrumentation can change timing.
 
 To repeat the cold JUnit control, run `"${common[@]}" :junit:test --rerun` under a 120-second watchdog. To exercise the gate regression and publication tests, run `"${common[@]}" :instrumentation:base:test --tests trycatch.LegacyOwnershipProbeTest --tests trycatch.CoroutineOwnerPublicationTest`.
 
-For the full repository check, without the optional offline flag and with the existing configured repositories, use `./gradlew --no-daemon --max-workers=1 '-Dorg.gradle.jvmargs=-Xmx1200m -XX:MaxMetaspaceSize=384m -Dfile.encoding=UTF-8' -Pkotlin.compiler.execution.strategy=in-process :core:shadowJar check` under a 240-second watchdog. The first run after the fix timed out at 240 seconds during plugin work; the repeat passed, reusing completed tasks.
+For the full repository check, without the optional offline flag and with the existing configured repositories, use `./gradlew --no-daemon --max-workers=1 '-Dorg.gradle.jvmargs=-Xmx1200m -XX:MaxMetaspaceSize=384m -Dfile.encoding=UTF-8' -Pkotlin.compiler.execution.strategy=in-process :core:shadowJar check` under a 360-second watchdog. The schema 5 run passed, reusing completed tasks; the earlier schema 4 run required a repeat after its 240-second watchdog.
 
 For formatting, add `--continue` to the common Gradle arguments and run
 `:core:spotlessCheck :runtime:spotlessCheck :instrumentation:base:spotlessCheck :integration-test:spotlessCheck`.

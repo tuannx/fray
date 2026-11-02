@@ -83,12 +83,33 @@ classes and unsupported resource lookups are rejected. Seed lists contain 1–10
 the timeout covers input hashing as well as the child. Iterations run sequentially and stop at the
 first result other than completed.
 
-`outputDirectory` must not already exist, its parent must exist, and it must not overlap an input or
-replay directory. The CLI creates it without replacing existing files. For replay, make a separate
-config with a new output directory; the saved manifest determines the original seed and expected
-failure, and its app/runtime identity and artifacts must still match. Changes in pinned process
-policy, including relevant environment values such as locale or timezone, can make replay
-inconclusive. The CLI does not overwrite the input artifacts.
+Replay manifest schema 5 binds a bounded fingerprint of the complete JDK image, including file
+contents, paths, entry types, POSIX permissions, owner/group names and modification times. Discovery
+and replay check the image before and after each child, and all seeds in one CLI command must use
+the same image.
+Relative symlinks must resolve inside the image; unsupported or escaping links and filesystems
+without POSIX metadata are rejected. The fingerprint is observed from the caller's trusted image;
+it is not an independent authenticity check. Touching files or copying the image without preserving
+modification times can make replay inconclusive even if bytes are unchanged. Schema 4 and manifests
+without an explicit schema are rejected; re-record them using schema 5.
+
+The JDK fingerprint does not bind operating-system libraries, CPU state, ACLs or
+extended attributes. Inputs still need to be trusted and immutable during the entire command: a
+replacement followed by restoration between checks can evade pre/post scans.
+
+`outputDirectory` must not already exist, its parent must exist, and it must not overlap an input,
+replay directory, or the JDK image in either direction. The CLI creates it without replacing
+existing files. For replay, make a separate config with a new output directory; the saved manifest
+determines the original seed and expected failure, and its app/runtime identity and artifacts must
+still match. Changes in pinned process policy, including relevant environment values such as locale
+or timezone, can make replay inconclusive. The CLI does not overwrite the input artifacts.
+
+Backend cleanup targets and verifies the direct worker process; it cannot verify all descendants.
+The admitted cooperative workload excludes operating-system process creation. The separate lab
+watchdog sends process-group `SIGKILL` on a best-effort basis; descendants that change process
+group/session and uninterruptible processes are not guaranteed to stop. The signal is asynchronous,
+and cleanup is not guaranteed if the watchdog itself is killed or crashes. Neither mechanism is a
+security sandbox.
 
 Each command prints one JSON result with status, reason, attempted/completed counts, optional seed,
 recording directory and strict-replay flag. Exit codes are `0` for COMPLETED, `10` for

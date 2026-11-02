@@ -126,12 +126,15 @@ class CooperativeNegativeWorkerTest {
     assertEquals("Cooperative app or runtime policy was rejected", detached.reason)
     println("NEGATIVE_DETACHED_WORKER_UNSUPPORTED")
 
-    val suspended = probe("CooperativeSuspendedCase", 5_000)
+    // Budget includes hashing the complete JDK image before and after the child, not just workload
+    // time.
+    val suspended = probe("CooperativeSuspendedCase", 15_000)
     assertEquals(EpochStatus.INCONCLUSIVE, suspended.status, "suspended: ${suspended.reason}")
     val suspendedLog = Files.readString(assertNotNull(suspended.diagnosticLog))
     assertTrue(
         suspended.reason == "Child exceeded epoch deadline" ||
-            suspended.reason == "Workload, lifecycle or Fray completion was not verified",
+            suspended.reason == "Workload, lifecycle or Fray completion was not verified" ||
+            suspended.reason == "Epoch deadline exceeded during post-run verification",
         "unexpected suspended result: ${suspended.reason}\n$suspendedLog",
     )
     assertTrue(

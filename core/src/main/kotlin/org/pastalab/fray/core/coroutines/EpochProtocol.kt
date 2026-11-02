@@ -45,10 +45,12 @@ data class ExpectedApplicationFailure(
           failure.message?.startsWith(messagePrefix) == true
 }
 
+internal const val REPLAY_SCHEMA = 5
+
 /** Hashes bind the supplied artifacts; they do not assert that replay is deterministic. */
 @Serializable
 data class ReplayManifest(
-    val schema: Int = 4,
+    val schema: Int,
     val entrypoint: Entrypoint,
     val seed: Long,
     val classpathDigest: String,
@@ -204,7 +206,7 @@ internal object EpochProtocolValidator {
             failure.topClass.startsWith("org.pastalab.fray.core.") ||
             failure.topClass.startsWith("org.pastalab.fray.runtime.") ||
             !expected.matches(failure) ||
-            manifest.schema != 4 ||
+            manifest.schema != REPLAY_SCHEMA ||
             !validAppInventory(manifest.appJarSha256, manifest.appClasses) ||
             manifest.appJarSha256 != inputs.appJarSha256 ||
             manifest.appClasses != inputs.appClasses ||

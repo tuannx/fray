@@ -206,6 +206,7 @@ internal object CooperativeEpochExecution {
           }
           val inputs = requireNotNull(request.cooperativeInputs)
           ReplayManifest(
+              schema = REPLAY_SCHEMA,
               entrypoint = request.entrypoint,
               seed = request.seed,
               classpathDigest = request.classpathDigest,
